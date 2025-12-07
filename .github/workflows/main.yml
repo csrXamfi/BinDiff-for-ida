@@ -1,0 +1,161 @@
+name: cmake-build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  IDA_VERSION_FOR_ARTIFACT_NAME: "9.1.250226"
+  URL_TO_IDASDK_ZIP: https://vaclive.party/software/ida-pro/releases/download/9.1.250226/idasdk91.zip
+  SHA256_IDASDK_ZIP: 508f690e49ab0415a3f8d422826954ac8d3ae9b92f48121fcd1e53c68bc7e1f2
+  PATH_TO_IDASDK_CONTENT: idasdk91
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-24.04
+        - os: ubuntu-22.04
+        - os: macos-14
+        - os: macos-13
+        - os: windows-2022
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/checkout@v4
+      with:
+        repository: google/bindiff
+        ref: 1c908013e111ca9a36a3e0a182bab13f963f9658
+        path: bindiff
+
+    - uses: actions/checkout@v4
+      with:
+        repository: google/binexport
+        ref: bdb8c4430549e69d4a9a7531c59b197f3a0757e6
+        path: binexport
+
+    - name: Apply patch
+      shell: bash
+      run: |
+        cd binexport
+        git apply ../patches/binexport-bdb8c4430549e69d4a9a7531c59b197f3a0757e6.patch
+
+    - name: Install ninja-build tool
+      uses: aseprite/get-ninja@main
+
+    - name: Get idasdk
+      if: matrix.os != 'windows-2022'
+      shell: bash
+      run: |
+        mkdir -p build/out build/ida
+        curl -L -o build/idasdk.zip "${{ env.URL_TO_IDASDK_ZIP }}"
+        echo "${{ env.SHA256_IDASDK_ZIP }}  build/idasdk.zip" | shasum -a 256 --check -
+        if [ $? -ne 0 ]; then
+          echo "[!] SHA256 checksum does not match. Aborting."
+          exit 1
+        fi
+        unzip -q build/idasdk.zip -d build/ida/
+
+    - name: Get idasdk (Windows)
+      if: matrix.os == 'windows-2022'
+      shell: pwsh
+      run: |
+        mkdir -p build\out
+        mkdir -p build\ida
+        Invoke-WebRequest -Uri "${{ env.URL_TO_IDASDK_ZIP }}" -OutFile "build\idasdk.zip"
+        $sha256 = Get-FileHash -Path "build\idasdk.zip" -Algorithm SHA256
+        if ($sha256.Hash -ne "${{ env.SHA256_IDASDK_ZIP }}") {
+          Write-Host "[!] SHA256 checksum does not match. Aborting."
+          exit 1
+        }
+        Expand-Archive -Path "build\idasdk.zip" -DestinationPath "build\ida\" -Force
+
+    - name: Enable Developer Command Prompt (Windows)
+      if: matrix.os == 'windows-2022'
+      uses: ilammy/msvc-dev-cmd@v1.12.1
+
+    - name: Enable mold linker (Linux)
+      if: matrix.os == 'ubuntu-24.04' || matrix.os == 'ubuntu-22.04'
+      uses: rui314/setup-mold@v1
+
+    - name: Install boost
+      uses: MarkusJx/install-boost@v2
+      id: install-boost
+      with:
+        boost_version: 1.83.0
+        platform_version: ${{ matrix.os == 'windows-2022' && '2022' || matrix.os == 'ubuntu-24.04' && '22.04' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'macos-14' && '14' || matrix.os == 'macos-13' && '13' }}
+        toolset: ${{ matrix.os == 'windows-2022' && 'msvc' || matrix.os == 'ubuntu-24.04' && 'gcc' || matrix.os == 'ubuntu-22.04' && 'gcc' || matrix.os == 'macos-14' && 'clang' || matrix.os == 'macos-13' && 'clang' }}
+        arch: ${{ matrix.os != 'macos-14' && 'x86' || matrix.os == 'macos-14' && 'aarch64' }}
+
+    - name: Configure CMake
+      shell: bash
+      env:
+        BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
+      run: |
+        cmake -S bindiff -B build/out -G Ninja \
+          "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}" \
+          -DCMAKE_INSTALL_PREFIX=build/out \
+          -DBINDIFF_BINEXPORT_DIR=binexport \
+          "-DIdaSdk_ROOT_DIR=${PWD}/build/ida/${{ env.PATH_TO_IDASDK_CONTENT }}" \
+          -DBoost_INCLUDE_DIR="${{ steps.install-boost.outputs.BOOST_ROOT }}/include" \
+          -DBoost_LIBRARY_DIRS="${{ steps.install-boost.outputs.BOOST_ROOT }}/lib"
+
+    - name: Build
+      working-directory: build/out
+      shell: bash
+      run: cmake --build . --config "${BUILD_TYPE}"
+
+    - name: Test
+      working-directory: build/out
+      shell: bash
+      run: ctest --build-config "${BUILD_TYPE}" --output-on-failure -R '^[A-Z]'
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: BinDiff-IDA-${{ env.IDA_VERSION_FOR_ARTIFACT_NAME }}-${{ matrix.os }}
+        path: |
+          build/out/bindiff
+          build/out/bindiff.exe
+          build/out/ida/bindiff*
+          build/out/tools/bindiff*
+
+    - name: Configure CMake (binexport)
+      shell: bash
+      env:
+        BOOST_ROOT: ${{ steps.install-boost.outputs.BOOST_ROOT }}
+      run: |
+        cmake -S binexport -B build/out/_deps/binexport-build -G Ninja \
+          "-DCMAKE_BUILD_TYPE=${BUILD_TYPE}" \
+          -DCMAKE_INSTALL_PREFIX=build/out/_deps/binexport-build \
+          -DBINEXPORT_ENABLE_IDAPRO=ON \
+          -DBINEXPORT_ENABLE_BINARYNINJA=ON \
+          "-DIdaSdk_ROOT_DIR=${PWD}/build/ida/${{ env.PATH_TO_IDASDK_CONTENT }}" \
+          -DBoost_INCLUDE_DIR="${{ steps.install-boost.outputs.BOOST_ROOT }}/include" \
+          -DBoost_LIBRARY_DIRS="${{ steps.install-boost.outputs.BOOST_ROOT }}/lib"
+
+    - name: Build (binexport)
+      working-directory: build/out/_deps/binexport-build
+      shell: bash
+      run: cmake --build . --config "${BUILD_TYPE}"
+
+    - name: Test (binexport)
+      working-directory: build/out/_deps/binexport-build
+      shell: bash
+      run: ctest --build-config "${BUILD_TYPE}" --output-on-failure -R '^[A-Z]'
+
+    - name: Upload Build Artifacts (binexport)
+      uses: actions/upload-artifact@v4
+      with:
+        name: BinExport-IDA-${{ env.IDA_VERSION_FOR_ARTIFACT_NAME }}-${{ matrix.os }}
+        path: |
+          build/out/_deps/binexport-build/binaryninja/binexport*
+          build/out/_deps/binexport-build/ida/binexport*
+          build/out/_deps/binexport-build/tools/binexport2dump*
